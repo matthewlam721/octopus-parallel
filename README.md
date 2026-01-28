@@ -18,7 +18,7 @@ I achieved **14.84x speedup** (93.3% time reduction) on GPU parallel processing 
 | Satellite Imagery | 8.15x | 87.7% |
 | Video Frames | **14.84x** | **93.3%** |
 
-Code: [GitHub link]
+Code: [[GitHub link]](https://github.com/matthewlam721/octopus-parallel.git)
 
 ---
 
