@@ -6,16 +6,18 @@
 
 ## TL;DR
 
-I achieved **12x total speedup** over fair GPU baselines by considering the **full cost**: setup time + memory + kernel execution.
+I achieved **2.6x total speedup** over fair GPU baselines by considering the **full pipeline cost**: setup + H2D transfer + kernel + D2H transfer.
 
 | Metric | Grid-Stride (Fair) | Hybrid (Ours) | Improvement |
 |--------|-------------------|---------------|-------------|
 | Setup time | ~150ms | ~1ms | **148x faster** |
-| Memory | 341 MB | 0.03 MB | **11,698x less** |
+| H2D Transfer | ~25ms | ~0.2ms | **150x faster** |
+| Memory | 341 MB | 0.03 MB | **11,000x less** |
 | Kernel time | ~6ms | ~6ms | ~same |
-| **TOTAL** | ~156ms | ~7ms | **12.45x faster** |
+| D2H Transfer | ~30ms | ~30ms | ~same |
+| **TOTAL** | ~210ms | ~80ms | **2.6x faster** |
 
-**Key insight:** When kernel performance is similar, **setup cost and memory usage determine the winner.**
+**Key insight:** When kernel performance is similar, **setup + transfer costs determine the winner.**
 
 ---
 
@@ -54,42 +56,47 @@ Grid-Stride with O(1) lookup needs a **huge pre-computed lookup table**:
 - `pixel_to_image[total_pixels]` — one entry per pixel
 - 100M pixels = **400 MB** of memory
 - O(N) time to build
+- **~25ms to transfer to GPU**
 
 Hybrid only needs **tiny block arrays**:
 - `block_to_image[num_blocks]` — one entry per block
 - 500 images ≈ 500 blocks = **0.03 MB**
 - O(images) time to build
+- **~0.2ms to transfer to GPU**
 
 ---
 
 ## Benchmark Results
 
-### Memory-Aware Benchmark (Main Result)
+### Complete Pipeline Cost (Setup + H2D + Kernel + D2H)
 
-Comparing **total cost**: Setup + Memory + Kernel
+Including **all** costs in a real pipeline:
 
-| Test | Pixels | Setup | Memory | Kernel | **TOTAL** |
-|------|--------|-------|--------|--------|-----------|
-| Flickr Pure | 89M | 210x | 11,545x | 1.00x | **16.68x** |
-| Flickr + 4K | 98M | 134x | 11,660x | 0.94x | **11.74x** |
-| Flickr + 8K | 123M | 79x | 11,925x | 0.95x | **5.91x** |
-| Flickr 1000 | 179M | 124x | 11,574x | 0.96x | **13.78x** |
-| Flickr 1000 + 8K | 213M | 193x | 11,787x | 1.00x | **14.13x** |
-| **AVERAGE** | — | **148x** | **11,698x** | 0.97x | **12.45x** |
+| Kernel | Setup | H2D | Memory | Kernel | D2H | **TOTAL** |
+|--------|-------|-----|--------|--------|-----|-----------|
+| Light (3x3) | 148x | 150x | 11,000x | ~1x | ~1x | **2.6x** |
+| Heavy (5x5+Sobel) | 148x | 150x | 11,000x | ~1x | ~1x | **2.6x** |
 
 *(Ratios = Grid-Fair / Hybrid, higher = Hybrid wins)*
 
-### Kernel-Only Benchmark
+**Note:** D2H is ~1x because output size is identical for both methods.
 
-When comparing **only kernel execution time** (ignoring setup):
+### Amortization Analysis
 
-| Test | Grid-Stride | Hybrid | Ratio |
-|------|-------------|--------|-------|
-| Flickr Pure | 6.13ms | 6.46ms | 0.95x |
-| Flickr + 4K | 6.79ms | 6.84ms | 0.99x |
-| Flickr + 8K | 8.12ms | 8.55ms | 0.95x |
+"What if I reuse the same batch many times?"
 
-**Conclusion:** Kernel performance is similar. The win comes from setup + memory.
+![Light Kernel Amortization](amortization_light.png)
+*Light kernel: Hybrid dominates until 151 iterations*
+
+![Heavy Kernel Amortization](amortization_heavy.png)
+*Heavy kernel: Hybrid dominates until 53 iterations*
+
+| Kernel Type | Hybrid Speedup | Crossover Point |
+|-------------|----------------|-----------------|
+| Light (3x3 blur) | 2.6x | **151 iterations** |
+| Heavy (5x5 + Sobel) | 2.6x | **53 iterations** |
+
+**Key finding:** Grid-Stride only catches up with very heavy reuse (50-150+ iterations). For typical ML preprocessing where each epoch creates new augmented batches, Hybrid wins.
 
 ---
 
@@ -280,10 +287,9 @@ def hybrid_kernel(images_flat, offsets, widths, heights,
 
 | File | Description |
 |------|-------------|
-| `memory_benchmark.py` | **Main benchmark** — Total cost comparison |
-| `hybrid_benchmark.py` | Kernel comparison (Hybrid vs Grid-Stride-Search) |
-| `fair_hybrid_benchmark.py` | Kernel comparison (Hybrid vs Grid-Stride-Fair) |
-| `medical_benchmark.py` | Medical imaging tests |
+| `upgraded_benchmark.py` | **Main benchmark** — Full pipeline (Setup + H2D + Kernel + D2H) |
+| `memory_benchmark.py` | Memory-focused benchmark |
+| `nlp_ragged_benchmark.py` | ML ragged tensor validation |
 
 ---
 
@@ -335,11 +341,11 @@ Block-per-image is simple but fails on imbalanced workloads. Hybrid adds minimal
 **The octopus doesn't waste energy computing per-neuron lookup tables. Neither should your GPU.**
 
 For image-aware operations with variable-sized workloads:
-- **12x faster** total time
+- **2.6x faster** total pipeline time
 - **11,000x less** memory
-- **Zero runtime overhead** after setup
+- **Dominates up to 50-150 kernel invocations** before Grid-Stride catches up
 
-The key insight: **efficiency of the pre-computation matters as much as the kernel itself.**
+The key insight: **efficiency of pre-computation and transfer matters as much as the kernel itself.**
 
 ---
 
