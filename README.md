@@ -36,7 +36,7 @@ The key insight is that for image-aware operations, the "fair" baseline (Grid-St
 
 ---
 
-## The Journey: From 252x to Honest 12x
+## The Journey: From 252x to Honest 2.6x
 
 ### What I Originally Claimed
 > "252x speedup on GPU parallel processing!"
@@ -47,8 +47,19 @@ The key insight is that for image-aware operations, the "fair" baseline (Grid-St
 |----------|---------|---------|
 | Naive (1 thread/image) | 252x | ❌ Strawman — nobody does this |
 | Grid-Stride (O(n) search) | 9-10x | ❌ Unfair — baseline has O(n) bug |
-| Grid-Stride (O(1) lookup) | 0.95x | 😬 Kernel-only comparison |
-| **Grid-Stride (O(1) + setup)** | **12x** | ✅ **Fair total cost comparison** |
+| Grid-Stride (O(1) lookup) | ~1x | 😬 Kernel-only comparison |
+| Grid-Stride (O(1) + setup) | ~12x | ✅ Fair (without transfer) |
+| **Grid-Stride (O(1) + full pipeline)** | **2.6x** | ✅ **End-to-end with H2D/D2H** |
+
+### Three Key Numbers
+
+| Metric | Value | What It Measures |
+|--------|-------|------------------|
+| **Kernel-only** | ~1x | Proves no cheating — same throughput |
+| **Without transfer** | ~12x | Setup + kernel (memory_benchmark.py) |
+| **End-to-end** | **2.6x** | Full pipeline: Setup + H2D + Kernel + D2H |
+
+**Headline claim: up to 12× without transfer, and 2.6× end-to-end including transfer.**
 
 ### The Real Win
 
@@ -74,10 +85,12 @@ Including **all** costs in a real pipeline:
 
 | Kernel | Setup | H2D | Memory | Kernel | D2H | **TOTAL** |
 |--------|-------|-----|--------|--------|-----|-----------|
-| Light (3x3) | 148x | 150x | 11,000x | ~1x | ~1x | **2.6x** |
-| Heavy (5x5+Sobel) | 148x | 150x | 11,000x | ~1x | ~1x | **2.6x** |
+| Light (3x3 blur) | 148x | 150x | 11,000x | ~1x | ~1x | **2.6x** |
+| Heavy (5x5 Gaussian + Sobel composite) | 148x | 150x | 11,000x | ~1x | ~1x | **2.6x** |
 
 *(Ratios = Grid-Fair / Hybrid, higher = Hybrid wins)*
+
+**Note:** Heavy kernel applies 5x5 Gaussian blur and Sobel edge detection as a single-pass composite. Sobel is applied to original signal to preserve edge strength.
 
 **Note:** D2H is ~1x because output size is identical for both methods.
 
