@@ -1,8 +1,8 @@
-# 🐙 Octopus: Block-Level Metadata for Ragged Tensors
+# 🐙 Octopus-Inspired GPU Load Balancing
 
-The name "Octopus" reflects the distributed, efficient coordination 
-— but the core technique is straightforward: replace O(N) per-element 
-mapping with O(B) block-level metadata.
+**Bio-inspired adaptive block assignment for image processing**
+
+---
 
 ## TL;DR
 
@@ -193,17 +193,24 @@ Hybrid's benefit is proportional to:
 
 ## The Octopus Insight
 
-An octopus has ~500 million neurons distributed across 8 arms. Each arm operates semi-independently, yet they coordinate perfectly.
+An octopus has ~500 million neurons distributed across 8 arms. But the brain doesn't micromanage every neuron — it coordinates at the **arm level**. Each arm has local autonomy to handle its own movements.
 
-**How?** The octopus pre-computes force distribution so no arm waits for another.
+**This is exactly our approach:**
 
-**GPU translation:** Pre-compute work distribution so no thread waits — but do it **efficiently**.
+| Octopus | GPU (Naive) | GPU (Hybrid) |
+|---------|-------------|--------------|
+| Coordinate per-neuron | Coordinate per-element | Coordinate per-block |
+| ❌ Impossible (500M neurons) | ❌ Expensive (O(N) mapping) | ✅ Efficient (O(B) metadata) |
+
+**The insight:** Don't micromanage at the element level. Coordinate at the block level.
 
 ```
-Grid-Stride-Fair: Pre-compute per-PIXEL  → O(N) setup, O(N) memory
-Hybrid:           Pre-compute per-BLOCK  → O(B) setup, O(B) memory
-                  where B << N
+Naive mapping:     element_to_seq[total_elements]  → O(N) memory
+Octopus approach:  block_to_seq[num_blocks]        → O(B) memory
+                   where B << N
 ```
+
+This is why Hybrid uses **11,000x less memory** — same reason an octopus brain doesn't need 500M direct connections.
 
 ---
 
