@@ -1,256 +1,146 @@
 # 🐙 Octopus: Block-Level GPU Scheduling for Variable-Length Batches
 
-I needed to process batches of variable-sized images on GPU without padding. Tried three approaches, benchmarked them on two GPUs, and found that cache size matters more than I expected.
+I had a batch of 10,000 images, all different sizes. Wanted to process them on GPU without padding everything to the max size (wasteful). The obvious solution is to flatten them into one big array, but then... how does each GPU thread know which image it's working on?
 
-Why "Octopus"? Each CUDA block independently knows its task via O(1) lookup, like how octopus arms process locally without waiting for the brain. That's the extent of the analogy—the rest is just benchmarks.
+Tried three approaches. Benchmarked on RTX 4090, T4, and Jetson Orin Nano. Turns out cache size matters way more than I expected.
 
-## The Problem
-
-You have 10,000 images of different sizes. You want to run a kernel on all pixels. Options:
-
-1. **Pad everything** to max size → wastes compute
-2. **Flatten into one array** → but then how does each thread know which image it's processing?
-
-I tested three solutions to #2.
-
-## Three Approaches
-
+## The Three Approaches
 ```
 Flattened pixels:  [████ img0 ████|██ img1 ██|██████ img2 ██████|...]
                     ↑ pixel 12345 belongs to which image?
-
-A (Table):    pixel_to_image = [0,0,0,0,0, 1,1,1, 2,2,2,2,2,2...]
-              └─ 500M entries = 2GB memory ❌
-
-B (Search):   offsets = [0, 50000, 80000, 140000...]
-              └─ Binary search per pixel, O(log M) ⚠️
-              └─ 0.08 MB, but cache-dependent
-
-C (Block):    block_to_image = [0, 0, 1, 2, 2, 2...]
-              block_range    = [(0,32K), (32K,50K), (0,30K), ...]
-              └─ O(1) lookup per block ✅
-              └─ 0.27 MB, deterministic
 ```
 
-### A: Lookup Table
-```python
-# Build a mapping for every pixel
-pixel_to_image[pixel_idx] → image_id
+**A: Lookup Table** — Store `pixel_to_image[i]` for every pixel. Simple, but 500M pixels × 4 bytes = 2GB. Nope.
 
-# 500M pixels × 4 bytes = 2GB memory
+**B: Binary Search** — Just store where each image starts. Each thread does binary search to find its image. Tiny memory, but O(log n) per pixel and cache-dependent.
+
+**C: Block Metadata** — Each CUDA block knows which image it handles. O(1) lookup per block, not per pixel. Small memory, deterministic access pattern.
+
+## The Results
+
+On my 4090 (72MB L2 cache), B and C were basically the same. Everything fits in cache, binary search is free.
+
+On T4 (4MB L2), C started winning by 22-28%. Cache pressure is real.
+
+On Jetson (4MB L2, but 3x less memory bandwidth)... C crushed B by 2.5-3.5x. Those 17 binary search lookups per pixel really add up when memory is slow.
+
+| GPU | L2 Cache | Memory BW | C vs B |
+|-----|----------|-----------|--------|
+| RTX 4090 | 72 MB | 1 TB/s | ~same |
+| T4 | 4 MB | 320 GB/s | 1.2-1.3x |
+| Jetson Orin Nano | 4 MB | 102 GB/s | **2.5-3.5x** |
+
+## Jetson Numbers
+
+This is where it gets interesting. Ran a bunch of different tests:
+
+**Scaling with image count:**
+- 50K images: 3.45x faster
+- 100K images: 2.59x faster  
+- 250K images: 2.55x faster
+
+**Real-world scenarios:**
+- 100 actual photos (14K-2M pixels each): 1.48x
+- 500 video frames: 1.91x
+- 5K drone/satellite tiles: 2.75x
+- 50K tiny patches: 3.45x
+
+**Different operations:**
+- Simple stuff (multiply, normalize, threshold): 2.5-4x speedup
+- Compute-heavy stuff (blur, gamma): ~1x, the math dominates
+
+**Crop & resize for ML preprocessing (bilinear, 1000 crops from 4K image):**
+- CPU (OpenCV): 680 ms
+- GPU (Octopus): 172 ms
+- 4x faster
+
+The pattern: more images = deeper binary search = bigger win for block metadata. And memory-bound ops benefit way more than compute-bound ones.
+
+## Honest Caveat: 3x3 Blur
+
+For compute-heavy operations like 3x3 blur, B and C perform about the same on Jetson:
+
+| Images | B (Search) | C (Block) | Speedup |
+|--------|------------|-----------|---------|
+| 50K | 28.6 ms | 28.5 ms | 1.00x |
+| 100K | 57.2 ms | 56.5 ms | 1.01x |
+| 150K | 85.4 ms | 84.1 ms | 1.02x |
+
+The binary search overhead gets buried under the actual computation. Each pixel reads 9 neighbors, does math — the O(log n) lookup becomes negligible.
+
+**Bottom line:** Block metadata wins big for memory-bound ops (multiply, normalize, threshold). For compute-bound ops (blur, convolution, gamma), it doesn't really matter which approach you use.
+
+## T4 Numbers
+
+Similar story, just smaller gains since it has 3x the memory bandwidth of Jetson.
+
+- 100K images: 22% faster
+- 500K images: 28% faster
+- Real video frames: 22% faster
+
+Also ran YOLO object detection on 200 frames. GPU preprocessing gave 2.9x end-to-end speedup (4384ms → 1490ms) with identical detection results.
+
+## Auto-Tuner
+
+Built a simple thing that runs two micro-benchmarks (multiply and blur) to decide whether block metadata is worth it on whatever hardware you're running. Takes <50ms.
+```
+[Probe 1: Multiply (memory-bound)]
+  B: 17.29 ms, C: 5.45 ms → 3.17x
+
+[Probe 2: Blur (compute-bound)]  
+  B: 33.11 ms, C: 28.83 ms → 1.15x
+
+→ Use BLOCK METADATA (C)
+  Reason: Memory-bound ops benefit significantly
 ```
 
-### B: Binary Search  
-```python
-# Store only offsets (where each image starts)
-# Kernel does binary search: O(log M) per pixel
-offsets = [0, 50000, 120000, ...]  # M entries
-```
-
-### C: Block-Level Metadata
-```python
-# Each CUDA block knows which image it handles
-# O(1) lookup per block, not per pixel
-block_to_image[block_id] → image_id
-```
-
-## Results
-
-### The Short Version
-
-On a beefy GPU (RTX 4090 with 72MB L2 cache), binary search and block metadata perform about the same. The offset array fits in cache, so the O(log n) lookups are basically free.
-
-On a smaller GPU (T4 with 4MB L2 cache), block metadata wins by 22-28%. Once the offset array spills out of cache, binary search starts paying for those random memory accesses.
-
-### T4 GPU Benchmarks (4MB L2 Cache)
-
-This is where it gets interesting. T4 has similar cache to edge devices like Jetson.
-
-**Synthetic Benchmark:**
-
-| Images | B (Search) Kernel | C (Block) Kernel | Speedup |
-|--------|-------------------|------------------|---------|
-| 100K | 19.11 ms | 14.89 ms | **22% faster** |
-| 200K | 39.79 ms | 29.41 ms | **26% faster** |
-| 500K | 102.67 ms | 74.03 ms | **28% faster** |
-
-**Video Frame Benchmark (600 frames, 277M pixels, 16x size imbalance):**
-
-| Approach | Memory | Kernel | Total |
-|----------|--------|--------|-------|
-| A (Table) | 1059 MB | 81.04 ms | 1446 ms |
-| B (Search) | 0.005 MB | 87.82 ms | 515 ms |
-| C (Block) | 0.088 MB | 68.37 ms | 497 ms |
-
-**C kernel 22% faster than B on real video data.**
-
-### RTX 4090 Benchmarks (72MB L2 Cache)
-
-For comparison, here's what happens on a high-end GPU where cache isn't a bottleneck.
-
-**Synthetic Benchmark (10K images, 500M pixels):**
-
-| Approach | Memory | Kernel | Total |
-|----------|--------|--------|-------|
-| A (Table) | 2475 MB | 31 ms | 1117 ms |
-| B (Search) | 0.08 MB | 36 ms | 292 ms |
-| C (Block) | 0.27 MB | 31 ms | 288 ms |
-
-**Video Frame Benchmark (1300 frames, 862M pixels):**
-
-| Approach | Memory | Kernel | Total |
-|----------|--------|--------|-------|
-| A (Table) | 3289 MB | 50 ms | 2021 ms |
-| B (Search) | 0.01 MB | 50 ms | 409 ms |
-| C (Block) | 0.26 MB | 49 ms | 409 ms |
-
-B and C essentially tied on 4090—offset array fits entirely in 72MB L2 cache.
-
-### YOLO Object Detection Pipeline
-
-This is where it gets practical. I ran YOLOv8 on 200 variable-size frames to see if the preprocessing gains actually matter in a real ML pipeline.
-
-**T4 (200 frames, variable size → 640×640):**
-
-| Method | Preprocess | Inference | Total |
-|--------|------------|-----------|-------|
-| CPU (PIL) | 2891 ms | 1493 ms | 4384 ms |
-| GPU | 507 ms | 983 ms | 1490 ms |
-
-That's **2.9x faster end-to-end** with identical results (93 detections). The CPU on T4 is slow enough that GPU preprocessing isn't optional—it's necessary.
-
-**RTX 4090 (200 frames):**
-
-| Method | Preprocess | Inference | Total |
-|--------|------------|-----------|-------|
-| CPU (PIL) | 1530 ms | 347 ms | 1877 ms |
-| GPU | 208 ms | 939 ms | 1147 ms |
-
-Still 1.6x faster, but the 4090's CPU is beefy enough that you could get away with PIL if you had to.
-
-The takeaway: on weaker hardware, GPU preprocessing matters more, not less.
-
-## Why C Beats B on Small Cache
-
-Binary search does O(log M) memory accesses per pixel. With 500K images:
-
-- log₂(500000) = 19 lookups per pixel
-- Offset array = 3.8 MB (doesn't fit in 4MB L2)
-- Random access pattern = cache misses
-
-Block metadata does O(1) lookup per CUDA block:
-
-- One read of `block_to_image` per block
-- Sequential memory access within block
-- Deterministic, cache-friendly
-
-The 28% kernel speedup on T4 (500K images) matches this analysis—when offset array exceeds L2 cache, binary search pays the penalty.
+If multiply shows big speedup but blur doesn't, your workload is memory-bound → use C. Otherwise, doesn't matter.
 
 ## When to Use What
 
-| Your Situation | Recommendation |
-|----------------|----------------|
-| High-end GPU (4090, A100) | B or C, doesn't matter |
-| Edge device (Jetson, <4MB L2) | **C (block metadata)** |
-| Memory constrained | B (smallest footprint) |
-| Need per-block scheduling | **C (only option)** |
-| Simple batching | B (easier to implement) |
+- **Beefy GPU (4090, A100)**: Doesn't matter, pick whichever
+- **Edge device + memory-bound ops**: Block metadata, definitely
+- **Edge device + compute-bound ops**: Doesn't matter
+- **Need scheduling flexibility**: Block metadata is the only option anyway
+- **Memory super tight**: Binary search uses less memory
 
-## The Real Win: Scheduling Flexibility
+## The Why
 
-Beyond performance, block metadata enables per-block scheduling:
+Binary search does O(log M) random memory accesses per pixel. With 100K images that's 17 lookups. On Jetson with 102 GB/s bandwidth, random access hurts.
 
-```python
-block_info = {
-    'image_id': 3,
-    'priority': HIGH,      # process important images first  
-    'kernel_type': BLUR,   # different operations per block
-    'stream_id': 2,        # multi-stream scheduling
-}
-```
+Block metadata does O(1) lookup per block. Sequential access within each block. Cache-friendly, predictable.
 
-If you just need image IDs, use B. If you need scheduling flexibility, C is the only option.
+But if you're doing heavy computation per pixel anyway (blur = 9 reads + math), that lookup overhead becomes noise.
 
-## Where This Actually Matters
-
-This probably isn't useful if you're running inference on an A100 in the cloud. It's for the edge cases (literally):
-
-- **Jetson and similar edge devices**: 4MB L2 cache, 102 GB/s memory bandwidth. You can't just throw more hardware at it.
-- **Satellite/drone imagery**: Variable-size tiles coming off sensors, real-time processing requirements, power budget measured in watts.
-- **Multi-tenant GPU scenarios**: When you're sharing cache with other workloads, deterministic O(1) access beats variable O(log n).
-- **Gigapixel medical/satellite images**: A 100K×100K image would need a 40GB lookup table. Block metadata is the only practical option.
-
-## Limitations
-
-A few caveats worth mentioning:
-
-- This is all Numba CUDA, not raw CUDA C. A proper C implementation would be faster for both approaches, though the relative difference should hold.
-- D2H transfer time dominates the total runtime in these benchmarks. In a fused pipeline where you don't copy back to host, the kernel speedup would matter more.
-- On high-end GPUs with PyTorch available, just use `F.interpolate`. It's faster and easier. This approach is for when you're on edge hardware without PyTorch or need custom kernels.
-
-## Running the Benchmarks
-
+## Running It
 ```bash
-# Install dependencies
-pip install numba numpy pillow torch ultralytics
+pip install numba numpy pillow
 
-# Synthetic benchmark
+# RTX 4090 / high-end GPU
 python triple_baseline_benchmark.py --images 10000
 
-# Larger scale (T4/edge focus)
+# T4 (Google Colab)
 python triple_baseline_benchmark.py --images 100000 --tiny
-python triple_baseline_benchmark.py --images 500000 --tiny
 
-# Video frame benchmark (requires ffmpeg)
-python video_frame_extract.py --download --extract --prepare
-python video_benchmark.py
-
-# YOLO pipeline benchmark
-python edge_benchmark.py
+# Jetson (8GB shared memory, can't run approach A)
+python test_multi_v2.py           # B vs C comparison
+python test_real_scale.py         # Real-world scenarios
+python test_bc_blur.py            # Blur comparison (spoiler: ~same)
+python auto_tuner.py              # Hardware probe
+python crop_resize_bilinear_benchmark.py  # ML preprocessing
 ```
-
-## Code
-
-The benchmark is Python/Numba CUDA. Setup uses `@njit` for speed.
-
-Key kernel structure for approach C:
-
-```python
-@cuda.jit
-def kernel_c(images, offsets, widths, heights,
-             block_to_image, block_start, block_end, output):
-    
-    block_id = cuda.blockIdx.x
-    img_id = block_to_image[block_id]  # O(1)
-    
-    # Each thread processes pixels in its assigned range
-    for local_idx in range(block_start[block_id] + tid, 
-                           block_end[block_id], stride):
-        # ... do work
-```
-
-## Hardware Tested
-
-| GPU | L2 Cache | Memory BW | What I found |
-|-----|----------|-----------|--------------|
-| RTX 4090 | 72 MB | 1 TB/s | B ≈ C. Everything fits in cache. |
-| T4 | 4 MB | 320 GB/s | C wins by 22-28%. Cache pressure is real. |
-| Jetson Orin Nano | 4 MB | 102 GB/s | Arriving Expecting bigger gap. |
-
-The T4 results were the surprise. I expected some improvement on smaller cache, but 28% on synthetic and 22% on real video data is more than I thought I'd see.
-
-Jetson has the same L2 size as T4 but 3x less memory bandwidth. If binary search is already hurting on T4, it should hurt more on Jetson.
 
 ## Files
 
-| File | Purpose |
-|------|---------|
-| `triple_baseline_benchmark.py` | Synthetic benchmark (A vs B vs C) |
-| `video_frame_extract.py` | Extract frames from video via ffmpeg |
-| `video_benchmark.py` | Benchmark on real video frames |
-| `edge_benchmark.py` | CPU vs GPU preprocessing comparison |
-| `yolo_benchmark.py` | YOLOv8 object detection pipeline |
+- `triple_baseline_benchmark.py` — Full A vs B vs C (needs >8GB GPU memory)
+- `test_multi_v2.py` — B vs C only, works on Jetson
+- `test_real_scale.py` — Different real-world scenarios
+- `test_functions.py` — Different operations (multiply, blur, etc)
+- `test_sizes.py` — Different image sizes
+- `test_bc_blur.py` — Blur kernel comparison
+- `auto_tuner.py` — Runtime hardware probe
+- `crop_resize_bilinear_benchmark.py` — ML preprocessing benchmark
 
 ---
 
-Questions or benchmarks on other hardware welcome.
+Tested on RTX 4090, T4 (Colab), and Jetson Orin Nano. The Jetson results surprised me — 3x speedup for simple ops, but basically nothing for blur. Makes sense in hindsight.
