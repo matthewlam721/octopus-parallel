@@ -50,11 +50,43 @@ This is where it gets interesting. Ran a bunch of different tests:
 - Compute-heavy stuff (blur, gamma): ~1x, the math dominates
 
 **Crop & resize for ML preprocessing (bilinear, 1000 crops from 4K image):**
-- CPU (OpenCV): 680 ms
-- GPU (Octopus): 172 ms
-- 4x faster
+- CPU (OpenCV): 643 ms
+- Individual CUDA kernels (1000 launches): 246 ms — kernel launch overhead adds up
+- Octopus (single launch): 172 ms kernel, 243 ms end-to-end
+- **3.7x faster than CPU, 1.43x faster than individual kernels**
 
 The pattern: more images = deeper binary search = bigger win for block metadata. And memory-bound ops benefit way more than compute-bound ones.
+
+## vs TensorRT on Jetson
+
+Had to test this — TensorRT is NVIDIA's own inference optimizer. Built a head-to-head for the crop+resize workload (1000 crops from 4K → 224×224 bilinear).
+
+**Uniform crops (256×256, TensorRT's best case):**
+
+| Method | Kernel | End-to-End | Notes |
+|--------|--------|------------|-------|
+| TensorRT | **25 ms** | 216 ms | 750MB padded input, 0% waste |
+| Octopus | 173 ms | 241 ms | ~4KB metadata |
+
+TensorRT kernel is 6.8x faster. No surprise — NVIDIA's hand-tuned resize kernel vs my numba JIT. But end-to-end is only 1.1x faster because transferring 750MB of padded data eats most of the gain.
+
+**Variable crops (32-512px, the real world):**
+
+TensorRT with all 1000 crops in one batch? Engine build fails. 1000 × 3 × 512 × 512 × 4 bytes ≈ 3GB of padded float32. On an 8GB Jetson, nope.
+
+So I split into batches of 100, each batch padded to its own max size:
+
+| Method | Kernel | End-to-End | Padding Waste |
+|--------|--------|------------|---------------|
+| TensorRT (10 batches) | **55 ms** | 536 ms | 70%, 2.9GB total transfer |
+| Octopus (single launch) | 172 ms | 243 ms | 0%, ~4KB metadata |
+
+TensorRT kernel is still 3x faster. But **Octopus end-to-end is 2.2x faster** because:
+- 70% of TensorRT's computation is on padding (a 32px crop padded to 512px = 256x wasted pixels)
+- 2.9GB of data needs to move host→GPU across 10 batches
+- 10 separate engine builds, 10 separate inference calls
+
+This isn't a knock on TensorRT — it's built for neural network inference where inputs are uniform. Variable-size image processing is just a different problem.
 
 ## Honest Caveat: 3x3 Blur
 
@@ -101,8 +133,9 @@ If multiply shows big speedup but blur doesn't, your workload is memory-bound �
 - **Beefy GPU (4090, A100)**: Doesn't matter, pick whichever
 - **Edge device + memory-bound ops**: Block metadata, definitely
 - **Edge device + compute-bound ops**: Doesn't matter
+- **Variable-size batches on edge**: Octopus over TensorRT — no padding, no multi-engine juggling
 - **Need scheduling flexibility**: Block metadata is the only option anyway
-- **Memory super tight**: Binary search uses less memory
+- **Memory super tight**: Binary search uses less memory (but slower)
 
 ## The Why
 
@@ -128,6 +161,8 @@ python test_real_scale.py         # Real-world scenarios
 python test_bc_blur.py            # Blur comparison (spoiler: ~same)
 python auto_tuner.py              # Hardware probe
 python crop_resize_bilinear_benchmark.py  # ML preprocessing
+python arena_benchmark.py         # TensorRT vs Octopus head-to-head
+python trt_batched_variable.py    # TensorRT batched variable-size
 ```
 
 ## Files
@@ -140,7 +175,9 @@ python crop_resize_bilinear_benchmark.py  # ML preprocessing
 - `test_bc_blur.py` — Blur kernel comparison
 - `auto_tuner.py` — Runtime hardware probe
 - `crop_resize_bilinear_benchmark.py` — ML preprocessing benchmark
+- `arena_benchmark.py` — TensorRT vs Octopus (uniform + variable crops)
+- `trt_batched_variable.py` — TensorRT batched approach for variable sizes
 
 ---
 
-Tested on RTX 4090, T4 (Colab), and Jetson Orin Nano. The Jetson results surprised me — 3x speedup for simple ops, but basically nothing for blur. Makes sense in hindsight.
+Tested on RTX 4090, T4 (Colab), and Jetson Orin Nano. The Jetson results surprised me — 3x speedup for simple ops, but basically nothing for blur. The TensorRT comparison was the other surprise: faster kernels don't mean faster pipelines when you're drowning in padding.
