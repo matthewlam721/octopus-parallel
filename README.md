@@ -129,6 +129,29 @@ All three make real-time, but the point isn't just "can it keep up" — it's how
 
 Scales linearly too: 738 detections (1s), 3985 (5s), 8471 (10s) — per-frame time stays at 4.3-4.8ms.
 
+## Power Efficiency on Edge
+
+If you're running on a drone or satellite, speed is only half the story. The other half is battery. So I measured actual power draw on Jetson using the onboard INA3221 sensors.
+
+Setup: 4K frame (3840×2160), variable-size crops (16-320px, drone/satellite detection distribution), sampled power every 2ms during sustained load.
+
+| Objects | Octopus (ms) | Individual (ms) | Speedup | Octopus (mJ) | Individual (mJ) | Energy Saved |
+|---------|-------------|----------------|---------|-------------|----------------|-------------|
+| 50 | 11.8 | 12.6 | 1.1x | 58.2 | 62.2 | +6.5% |
+| 100 | 21.2 | 24.7 | 1.2x | 104.0 | 121.8 | +14.6% |
+| 200 | 40.2 | 49.3 | 1.2x | 197.3 | 242.5 | +18.6% |
+| 500 | 100.5 | 122.5 | 1.2x | 493.6 | 602.8 | +18.1% |
+| 1000 | 198.5 | 244.8 | 1.2x | 975.2 | 1204.7 | +19.0% |
+| 2000 | 396.4 | 489.3 | 1.2x | 1947.1 | 2405.6 | +19.1% |
+| 3000 | 594.3 | 733.9 | 1.2x | 2919.6 | 3605.4 | +19.0% |
+| 5000 | 993.0 | 1221.9 | 1.2x | 4877.3 | 6002.8 | +18.7% |
+
+Idle power: ~4994 mW. Both methods draw about the same wattage (~4950 mW) during execution. The energy saving comes from Octopus finishing faster — GPU goes back to idle sooner.
+
+At 18 objects (like the surgical toolkit VR test I ran for a collaboration), there's zero measurable difference. The GPU barely wakes up. But at 100+ objects, the pattern is clear and consistent: **~19% less energy per frame**, plateauing from 200 objects onwards.
+
+19% less energy per frame means a drone flies 19% longer on the same battery, or a satellite squeezes 19% more inference per orbit. For something that's literally unreachable once it's launched, that matters.
+
 ## Honest Caveat: 3x3 Blur
 
 For compute-heavy operations like 3x3 blur, B and C perform about the same on Jetson:
@@ -206,6 +229,7 @@ python crop_resize_bilinear_benchmark.py  # ML preprocessing
 python arena_benchmark.py         # TensorRT vs Octopus head-to-head
 python trt_batched_variable.py    # TensorRT batched variable-size
 python edge_simulation.py         # Satellite & drone scenarios
+python power_benchmark_paper.py   #Power efficiency (needs root for sensors) 
 ```
 
 ## Files
@@ -221,7 +245,10 @@ python edge_simulation.py         # Satellite & drone scenarios
 - `arena_benchmark.py` — TensorRT vs Octopus (uniform + variable crops)
 - `trt_batched_variable.py` — TensorRT batched approach for variable sizes
 - `edge_simulation.py` — Satellite tile filtering & drone real-time classification
+- `power_benchmark_paper.py` — Power/energy measurement across object counts (paper data)
 
 ---
 
 Tested on RTX 4090, T4 (Colab), and Jetson Orin Nano. The Jetson results surprised me — 3x speedup for simple ops, but basically nothing for blur. The TensorRT comparison was the other surprise: faster kernels don't mean faster pipelines when you're drowning in padding. The satellite sim drove it home — 147ms of GPU time saving 8 minutes of downlink. That's the kind of trade-off that matters on edge.
+
+The power data was the cherry on top — 19% energy saving at scale, just from eliminating kernel launch overhead. On a battery that can't be recharged in orbit, that's not a nice-to-have.
