@@ -152,6 +152,34 @@ At 18 objects (like the surgical toolkit VR test I ran for a collaboration), the
 
 19% less energy per frame means a drone flies 19% longer on the same battery, or a satellite squeezes 19% more inference per orbit. For something that's literally unreachable once it's launched, that matters.
 
+## Real-World Data Distributions
+
+All my benchmarks above use uniform random crop sizes. A reviewer would rightfully ask: "what about real workloads?" Real detections aren't uniform — drone footage is 80% tiny distant objects with a few big ones up close. Satellite tiles cluster around two sizes. Video frames barely change between consecutive frames.
+
+So I tested three realistic distributions against uniform as baseline. 4K frame, 1000 objects.
+
+**Padding waste — this is the killer:**
+
+| Distribution | Actual Data | Padded to Max | Waste | Octopus Metadata |
+|---|---|---|---|---|
+| Uniform | 204.4 MB | 750.0 MB | 73% | 31.2 KB |
+| Long-tail (drone) | 17.8 MB | 456.6 MB | **96%** | 31.2 KB |
+| Bimodal (satellite) | 262.2 MB | 750.0 MB | 65% | 31.2 KB |
+
+Long-tail is brutal. 80% of your crops are 16-60px, but a handful of 400px detections force the entire batch to pad to 400. So you're transferring 456MB to process 17.8MB of actual data. 96% of your GPU memory bandwidth is literally processing zeros.
+
+Octopus doesn't care. 31.2KB of metadata regardless of distribution.
+
+**Speed across distributions (Jetson, 1000 objects):**
+
+Speedup is 1.19-1.20x across all distributions. Doesn't matter if crops are uniform, long-tail, or bimodal — the advantage comes from kernel launch overhead (1 launch vs 1000), not crop sizes. This isn't a best-case benchmark artifact.
+
+**Temporal coherence (video, 500 detections, 10 consecutive frames):**
+
+Frame-to-frame bbox jitter of ±5px. Both methods show near-zero variance (±0.06ms for Octopus, ±0.02ms for individual). No meaningful difference here — but it confirms neither method degrades with temporal correlation.
+
+The takeaway: uniform benchmarks actually *understate* the memory advantage. Real workloads with long-tail distributions make the padding problem worse, not better.
+
 ## Honest Caveat: 3x3 Blur
 
 For compute-heavy operations like 3x3 blur, B and C perform about the same on Jetson:
@@ -230,6 +258,7 @@ python arena_benchmark.py         # TensorRT vs Octopus head-to-head
 python trt_batched_variable.py    # TensorRT batched variable-size
 python edge_simulation.py         # Satellite & drone scenarios
 python power_benchmark_paper.py   #Power efficiency (needs root for sensors) 
+python3 distribution_benchmark.py    # Distribution impact (takes a while at 5000 objects)
 ```
 
 ## Files
@@ -246,6 +275,7 @@ python power_benchmark_paper.py   #Power efficiency (needs root for sensors)
 - `trt_batched_variable.py` — TensorRT batched approach for variable sizes
 - `edge_simulation.py` — Satellite tile filtering & drone real-time classification
 - `power_benchmark_paper.py` — Power/energy measurement across object counts (paper data)
+- `distribution_benchmark.py` — Uniform vs long-tail vs bimodal distributions
 
 ---
 
