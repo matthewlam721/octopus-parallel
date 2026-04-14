@@ -72,75 +72,80 @@ CROP_SIZE_DISTRIBUTION = {
 # POWER MONITORING (same as before, refined)
 # ============================================
 class JetsonPowerMonitor:
-    KNOWN_POWER_PATHS = [
-        "/sys/bus/i2c/drivers/ina3221x/6-0040/iio:device0/in_power0_input",
-        "/sys/bus/i2c/drivers/ina3221x/6-0040/iio:device0/in_power1_input",
-        "/sys/bus/i2c/drivers/ina3221x/6-0040/iio:device0/in_power2_input",
-        "/sys/bus/i2c/drivers/ina3221x/1-0040/iio:device0/in_power0_input",
-        "/sys/bus/i2c/drivers/ina3221x/1-0040/iio:device0/in_power1_input",
-    ]
-
+    """
+    Reads INA3221 sensors on Jetson Orin Nano.
+    Computes power = voltage(mV) × current(mA) / 1000 = mW.
+    Tracks BOTH VDD_IN (total system) and VDD_CPU_GPU_CV (compute rail).
+    """
+    
     def __init__(self):
-        self.power_paths = []
-        self.path_labels = []
-        self.total_power_path = None
+        self.rails = {}        # {label: (volt_path, curr_path)}
+        self.primary_label = None
         self._find_sensors()
-
+    
     def _find_sensors(self):
-        print("  Searching for power sensors...")
-        for path in self.KNOWN_POWER_PATHS:
-            if os.path.exists(path):
-                try:
-                    val = self._read_path(path)
-                    if val is not None and val >= 0:
-                        self.power_paths.append(path)
-                        self.path_labels.append(path.split("/")[-1])
-                        print(f"    Found: {path} → {val} mW")
-                except:
-                    pass
-
-        if not self.power_paths:
-            for pattern in ["/sys/class/hwmon/hwmon*/power*_input",
-                           "/sys/class/hwmon/hwmon*/in*_input",
-                           "/sys/bus/i2c/drivers/ina3221x/*/hwmon/hwmon*/in*_input"]:
-                for path in sorted(glob.glob(pattern)):
-                    try:
-                        val = self._read_path(path)
-                        if val is not None and val > 0:
-                            self.power_paths.append(path)
-                            self.path_labels.append(path.split("/")[-1])
-                            if len(self.power_paths) <= 5:
-                                print(f"    Found: {path} → {val} mW")
-                    except:
-                        pass
-
-        if self.power_paths:
-            self.total_power_path = self.power_paths[0]
-            print(f"  Primary sensor: {self.total_power_path}")
-        else:
-            print("  ⚠️  No power sensors found!")
-
+        import glob
+        print("  Searching INA3221 rails (V × I = P)...")
+        for label_path in sorted(glob.glob("/sys/class/hwmon/hwmon*/in*_label")):
+            try:
+                with open(label_path) as f:
+                    label = f.read().strip()
+                if label not in ("VDD_IN", "VDD_CPU_GPU_CV", "VDD_SOC"):
+                    continue
+                # Extract index
+                base = label_path.rsplit("/", 1)[0]
+                idx = label_path.split("/in")[-1].split("_")[0]
+                volt_path = f"{base}/in{idx}_input"
+                curr_path = f"{base}/curr{idx}_input"
+                if os.path.exists(volt_path) and os.path.exists(curr_path):
+                    v = self._read_path(volt_path)
+                    c = self._read_path(curr_path)
+                    p = (v * c) // 1000 if (v and c) else 0
+                    self.rails[label] = (volt_path, curr_path)
+                    print(f"    Found {label}: V={v}mV × I={c}mA = {p}mW")
+            except Exception:
+                pass
+        
+        # Pick primary: prefer VDD_IN (total), fallback to VDD_CPU_GPU_CV
+        for preferred in ("VDD_IN", "VDD_CPU_GPU_CV"):
+            if preferred in self.rails:
+                self.primary_label = preferred
+                print(f"  ★ Primary rail: {preferred}")
+                break
+        
+        if not self.rails:
+            print("  ⚠️ No INA3221 rails found!")
+    
     def _read_path(self, path):
         try:
             with open(path, 'r') as f:
                 return int(f.read().strip())
-        except:
+        except Exception:
             return None
-
+    
+    def _compute_power_mw(self, volt_path, curr_path):
+        v = self._read_path(volt_path)
+        c = self._read_path(curr_path)
+        if v is None or c is None:
+            return None
+        return (v * c) // 1000
+    
     def read_total_power_mw(self):
-        if self.total_power_path:
-            return self._read_path(self.total_power_path)
-        return None
-
+        """Returns primary rail power in mW."""
+        if self.primary_label is None:
+            return None
+        v_path, c_path = self.rails[self.primary_label]
+        return self._compute_power_mw(v_path, c_path)
+    
     def read_all_rails(self):
-        readings = {}
-        for path, label in zip(self.power_paths, self.path_labels):
-            val = self._read_path(path)
-            if val is not None:
-                readings[label] = val
-        return readings
-
-
+        """Returns {label: power_mw} for all rails."""
+        out = {}
+        for label, (v_path, c_path) in self.rails.items():
+            p = self._compute_power_mw(v_path, c_path)
+            if p is not None:
+                out[label] = p
+        return out
+    
 class PowerSampler:
     def __init__(self, monitor, interval_ms=2):
         self.monitor = monitor
